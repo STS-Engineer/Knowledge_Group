@@ -11,9 +11,9 @@ load_dotenv()
 
 app = Flask(__name__)
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-DATABASE_URL = "postgresql://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/knowledge_DB"
+
 # Database connection string
-DB_DSN = os.getenv("DATABASE_URL")
+DB_DSN = "postgresql://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/knowledge_DB"
 
 # --- Helper: Embedding Generation ---
 def generate_embedding(text):
