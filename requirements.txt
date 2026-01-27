@@ -1,0 +1,4 @@
+flask 
+psycopg 
+openai 
+python-dotenv
