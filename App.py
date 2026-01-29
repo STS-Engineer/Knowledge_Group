@@ -211,6 +211,105 @@ def resolve_parent(cur, parent_node_data):
     
     return str(cur.fetchone()[0])
 
+
+
+
+# --- Check Existence Route (Global Search) ---
+@app.route('/api/knowledge/check-existence', methods=['POST'])
+def check_existence():
+    """
+    Checks if a node exists globally based on Title (Exact/Fuzzy) and Content (Vector Similarity).
+    Input: { 
+        "title": "string", 
+        "structured_data": { ... }
+    }
+    """
+    data = request.json
+    title = data.get('title', '').strip()
+    struct_data = data.get('structured_data', {})
+    
+    # Extract narrative from structured_data or top-level fallback
+    narrative = struct_data.get('explanation') or data.get('narrative', '')
+
+    if not title:
+        return jsonify({"error": "Title is required"}), 400
+
+    # 1. Generate Embedding for the query
+    vector = generate_embedding(f"{title}: {narrative}")
+    
+    if not vector:
+        return jsonify({"error": "Failed to generate embedding"}), 500
+
+    try:
+        with psycopg.connect(DB_DSN) as conn:
+            with conn.cursor() as cur:
+                
+                # --- A. Check Exact Title Match (Global) ---
+                # We want to know if this title exists anywhere
+                cur.execute(
+                    "SELECT id, title, parent_id FROM knowledge_node WHERE title ILIKE %s", 
+                    (title,)
+                )
+                title_match = cur.fetchone()
+
+                # --- B. Check Vector Similarity (Global) ---
+                # Finds the closest semantic match in the entire database
+                cur.execute("""
+                    SELECT id, title, parent_id, 1 - (embedding <=> %s::vector) as similarity
+                    FROM knowledge_node 
+                    ORDER BY similarity DESC 
+                    LIMIT 1
+                """, (vector,))
+                
+                vector_match = cur.fetchone()
+
+                # --- C. Analyze Results ---
+                response = {
+                    "exists": False,
+                    "status": "new",
+                    "match_details": None
+                }
+
+                # Priority 1: Exact Title Match
+                if title_match:
+                    response["exists"] = True
+                    response["status"] = "exact_match"
+                    response["match_details"] = {
+                        "id": str(title_match[0]),
+                        "title": title_match[1],
+                        "reason": "Found identical title in database"
+                    }
+                
+                # Priority 2: High Vector Similarity (Duplicate Content)
+                elif vector_match:
+                    sim_score = vector_match[3]
+                    
+                    if sim_score > SIMILARITY_THRESHOLD_DUPLICATE:
+                        response["exists"] = True
+                        response["status"] = "duplicate_content"
+                        response["match_details"] = {
+                            "id": str(vector_match[0]),
+                            "title": vector_match[1],
+                            "similarity": round(sim_score, 4),
+                            "reason": "Content is semantically identical"
+                        }
+                    elif sim_score > SIMILARITY_THRESHOLD_MERGE:
+                        response["exists"] = True 
+                        response["status"] = "merge_candidate"
+                        response["match_details"] = {
+                            "id": str(vector_match[0]),
+                            "title": vector_match[1],
+                            "similarity": round(sim_score, 4),
+                            "reason": "Content is highly related; consider merging."
+                        }
+
+                return jsonify(response)
+
+    except Exception as e:
+        print(f"Error checking existence: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 # --- Main Route: Store Structure ---
 @app.route('/api/knowledge/store-structure', methods=['POST'])
 def store_structure():
