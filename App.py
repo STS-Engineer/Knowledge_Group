@@ -156,39 +156,45 @@ def smart_merge_or_create(cur, parent_id, node_data):
 
 def resolve_parent(cur, parent_node_data):
     """
-    Handles the Parent Node logic:
-    1. If action is 'link_existing', verify it exists and return ID.
-    2. If action is 'create_new', check if it actually exists (by title).
-       - If yes, return existing ID (don't duplicate).
-       - If no, insert it.
+    Robust Parent Resolver:
+    1. If linking to ID -> Verify ID exists.
+    2. If creating new -> Check if Title exists (Case Insensitive).
+       - If yes -> Return EXISTING ID (Prevent Duplicate).
+       - If no -> Create NEW Parent.
     """
     action = parent_node_data.get('action')
+    title = parent_node_data.get('title', '').strip()
     
-    # CASE 1: Linking to a known ID
-    if action == 'link_existing':
+    # CASE 1: Explicit Link by ID
+    if action == 'link_existing' and parent_node_data.get('id'):
         parent_id = parent_node_data.get('id')
-        if not parent_id:
-            raise ValueError("Action is 'link_existing' but no ID provided.")
-        return parent_id
+        # Verification: Does this ID actually exist?
+        cur.execute("SELECT id FROM knowledge_node WHERE id = %s", (parent_id,))
+        if cur.fetchone():
+            return str(parent_id)
+        else:
+            print(f"⚠️ Warning: Parent ID {parent_id} not found. Falling back to title search.")
 
-    # CASE 2: Creating New (or handling "Upsert")
-    title = parent_node_data['title']
-    node_type = parent_node_data.get('node_type', 'domain')
-    narrative = parent_node_data.get('narrative', '')
-    slug = parent_node_data.get('slug')
-
-    # A. Check if it already exists (Idempotency check)
-    cur.execute("SELECT id FROM knowledge_node WHERE title = %s", (title,))
+    # CASE 2: Search by Title (Prevent Duplicates)
+    # We use ILIKE for case-insensitive matching (e.g., "Finance" == "finance")
+    cur.execute("""
+        SELECT id FROM knowledge_node 
+        WHERE title ILIKE %s AND node_type = 'domain'
+    """, (title,))
+    
     existing = cur.fetchone()
     
     if existing:
-        print(f"ℹ️ Parent '{title}' already exists. Linking to it.")
+        print(f"✅ Found existing Parent '{title}'. Linking to ID: {existing[0]}")
         return str(existing[0])
 
-    # B. If not found, create it
-    print(f"🆕 Creating new Parent Domain: '{title}'")
+    # CASE 3: Truly New Parent
+    print(f"🆕 Creating NEW Parent Domain: '{title}'")
     
-    # Generate embedding for the parent immediately (optional but recommended)
+    # Generate embedding for the parent
+    narrative = parent_node_data.get('narrative', '')
+    slug = parent_node_data.get('slug')
+    node_type = parent_node_data.get('node_type', 'domain')
     vector = generate_embedding(f"{title}: {narrative}")
     
     cur.execute("""
@@ -205,58 +211,34 @@ def resolve_parent(cur, parent_node_data):
     
     return str(cur.fetchone()[0])
 
-
 # --- Main Route: Store Structure ---
 @app.route('/api/knowledge/store-structure', methods=['POST'])
 def store_structure():
     data = request.json
-    
-    # 1. The ID Map: Converts GPT's 'temp_id' -> Postgres 'Real UUID'
-    # Example: {'root_node': '550e8400-e29b...', 'child_1': '7d444840-...'}
     id_map = {}
-    created_real_ids = []
-    report_log = []
+    report_log = [] 
+    
     try:
         with psycopg.connect(DB_DSN) as conn:
             with conn.cursor() as cur:
                 
-                # --- Step A: Handle the Parent/Root ---
-                parent_node = data.get('parent_node')
-                parent_real_id = None
+                # --- Step A: Handle the Parent/Root (Safe Resolve) ---
+                p_node = data.get('parent_node')
+                root_id = resolve_parent(cur, p_node) 
+                
+                # Save mapping so keywords/children can find it
+                id_map[p_node['temp_id']] = root_id
 
-                if parent_node['action'] == 'link_existing':
-                    # User selected an existing domain
-                    parent_real_id = parent_node['id']
-                    # Map the temp_id to this existing UUID
-                    id_map[parent_node['temp_id']] = parent_real_id
-                else:
-                    # Create NEW Parent
-                    cur.execute("""
-                        INSERT INTO knowledge_node (title, node_type, structured_data) 
-                        VALUES (%s, %s, %s) 
-                        RETURNING id
-                    """, (
-                        parent_node['title'],
-                        parent_node['node_type'],
-                        json.dumps({"explanation": parent_node.get('narrative', '')})
-                    ))
-                    parent_real_id = str(cur.fetchone()[0])
-                    # Save mapping
-                    id_map[parent_node['temp_id']] = parent_real_id
-                    created_real_ids.append(parent_real_id)
-
-                # --- Step B: Create Children Nodes ---
-                root_id = resolve_parent(cur, parent_node) # Helper function
-                id_map[parent_node['temp_id']] = root_id
+                # --- Step B: Handle Children Nodes (Smart Merge) ---
                 nodes = data.get('nodes', [])
                 for node in nodes:
                     temp_parent = node.get('parent_temp_id')
                     real_parent_id = id_map.get(temp_parent)
                     
                     if not real_parent_id:
-                        raise ValueError(f"Parent {temp_parent} not found.")
+                        raise ValueError(f"Parent temp_id '{temp_parent}' not resolved.")
 
-                    # CALL THE SMART FUNCTION
+                    # Call Smart Function
                     real_child_id, status = smart_merge_or_create(
                         cur, 
                         real_parent_id, 
@@ -265,14 +247,85 @@ def store_structure():
                     
                     id_map[node['temp_id']] = real_child_id
                     
-                    # Log the result for the response
+                    # Log result
                     report_log.append({
                         "title": node['title'],
                         "status": status,
                         "id": real_child_id
                     })
 
+                    # Handle Attachments (Optional)
+                    attachments = node.get('attachments', [])
+                    for att in attachments:
+                        cur.execute("""
+                            INSERT INTO knowledge_attachment (node_id, file_name, file_type, file_path)
+                            VALUES (%s, %s, %s, %s)
+                        """, (real_child_id, att['name'], att['type'], att['path']))
+
+                # --- Step C: Keywords ---
+                keywords = data.get('keywords', [])
+                for kw in keywords:
+                    # 1. Insert Keyword or Update Synonyms
+                    cur.execute("""
+                        INSERT INTO keyword (label, synonyms) 
+                        VALUES (%s, %s)
+                        ON CONFLICT (label) 
+                        DO UPDATE SET synonyms = EXCLUDED.synonyms
+                        RETURNING id
+                    """, (
+                        kw['label'], 
+                        json.dumps(kw.get('synonyms', []))
+                    ))
+                    
+                    keyword_id = cur.fetchone()[0]
+
+                    # 2. Link to Nodes using ID Map
+                    node_temps = kw.get('node_temp_ids', [])
+                    weight = kw.get('weight', 1.0)
+                    
+                    for temp_id in node_temps:
+                        real_node_id = id_map.get(temp_id)
+                        
+                        if real_node_id:
+                            cur.execute("""
+                                INSERT INTO node_keyword (node_id, keyword_id, weight)
+                                VALUES (%s, %s, %s)
+                                ON CONFLICT (node_id, keyword_id) 
+                                DO UPDATE SET weight = EXCLUDED.weight
+                            """, (real_node_id, keyword_id, weight))
+
+                # --- Step D: Relationships (Edges) ---
+                relationships = data.get('relationships', [])
+                for rel in relationships:
+                    source_id = id_map.get(rel['source_temp_id'])
+                    target_id = id_map.get(rel['target_temp_id'])
+                    
+                    # Only create edge if both nodes exist in this batch/context
+                    if source_id and target_id:
+                        # Optional: Check for existing edge to prevent duplicates
+                        cur.execute("""
+                            SELECT id FROM knowledge_edge 
+                            WHERE source_node_id = %s AND target_node_id = %s AND relation_type = %s
+                        """, (source_id, target_id, rel['relation_type']))
+                        
+                        if not cur.fetchone():
+                            cur.execute("""
+                                INSERT INTO knowledge_edge (source_node_id, target_node_id, relation_type, description)
+                                VALUES (%s, %s, %s, %s)
+                            """, (
+                                source_id, 
+                                target_id, 
+                                rel['relation_type'], 
+                                rel.get('description')
+                            ))
+
             conn.commit()
+
+        # Launch background embeddings (Threaded)
+        # Collect all IDs created or resolved
+        all_affected_ids = list(id_map.values())
+        thread = threading.Thread(target=run_embedding_job, args=(all_affected_ids,))
+        thread.start()
 
         return jsonify({
             "success": True, 
@@ -281,8 +334,8 @@ def store_structure():
         })
 
     except Exception as e:
+        print(f"Error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
-    
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
