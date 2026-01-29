@@ -66,10 +66,10 @@ def run_embedding_job(node_ids):
 SIMILARITY_THRESHOLD_DUPLICATE = 0.95  # It's the same thing
 SIMILARITY_THRESHOLD_MERGE = 0.85      # It's related, check for new details
 
-def smart_merge_or_create(cur, parent_id, node_data):
+def smart_merge_or_create(cur, parent_id, node_data, user_email):
     """
     Intelligent logic to Check, Match, and Insert/Merge.
-    Returns: (node_id, status_message)
+    Now tracks created_by / updated_by.
     """
     title = node_data['title']
     narrative = node_data.get('narrative', '')
@@ -77,18 +77,16 @@ def smart_merge_or_create(cur, parent_id, node_data):
     slug = node_data.get('slug')
     node_type = node_data['node_type']
 
-    # 1. Generate Embedding for the NEW content immediately
-    # We need this to compare with existing nodes
+    # 1. Generate Embedding
     vector = generate_embedding(f"{title}: {narrative}")
+    
+    # Fallback to simple title match if OpenAI fails
     if not vector:
-        # Fallback to simple title match if OpenAI fails
         cur.execute("SELECT id FROM knowledge_node WHERE title = %s AND parent_id = %s", (title, parent_id))
         res = cur.fetchone()
         if res: return str(res[0]), "exists_title_match"
-        # Else Insert (code below)
 
-    # 2. Vector Search against SIBLINGS only (children of this parent)
-    # We look for the most similar existing child
+    # 2. Vector Search against SIBLINGS
     cur.execute("""
         SELECT id, title, structured_data, 1 - (embedding <=> %s::vector) as similarity
         FROM knowledge_node 
@@ -100,28 +98,23 @@ def smart_merge_or_create(cur, parent_id, node_data):
     match = cur.fetchone()
     
     # --- LOGIC DECISION TREE ---
-    
     if match:
         existing_id, existing_title, existing_struct, similarity = match
         
-        # SCENARIO A: DUPLICATE (High Similarity)
+        # SCENARIO A: DUPLICATE
         if similarity > SIMILARITY_THRESHOLD_DUPLICATE:
             return str(existing_id), f"skipped_duplicate_of_{existing_title}"
 
-        # SCENARIO B: MERGE CANDIDATE (High-ish Similarity)
-        # It talks about the same thing. Let's see if we have NEW data fields.
+        # SCENARIO B: MERGE CANDIDATE
         if similarity > SIMILARITY_THRESHOLD_MERGE:
-            # Check if new_struct has keys/values missing in existing_struct
             merged_struct = existing_struct.copy()
             updated = False
             
-            # Simple merge logic for lists (e.g., Risks, Methods)
             for key, val in new_struct.items():
                 if key not in merged_struct:
                     merged_struct[key] = val
                     updated = True
                 elif isinstance(val, list) and isinstance(merged_struct[key], list):
-                    # Append new items to the list (unique only)
                     current_set = set(merged_struct[key])
                     for item in val:
                         if item not in current_set:
@@ -129,38 +122,39 @@ def smart_merge_or_create(cur, parent_id, node_data):
                             updated = True
             
             if updated:
-                # Update the DB
+                # [UPDATE] Add updated_by and updated_at
                 cur.execute("""
                     UPDATE knowledge_node 
-                    SET structured_data = %s, updated_at = NOW()
+                    SET structured_data = %s, 
+                        updated_at = NOW(),
+                        updated_by = %s
                     WHERE id = %s
-                """, (json.dumps(merged_struct), existing_id))
+                """, (json.dumps(merged_struct), user_email, existing_id))
                 return str(existing_id), f"merged_new_info_into_{existing_title}"
             else:
                 return str(existing_id), f"skipped_no_new_info_vs_{existing_title}"
 
-    # SCENARIO C: NEW CONTENT (Low similarity or no match)
-    # Insert as a new sibling
+    # SCENARIO C: NEW CONTENT (Insert)
+    # [INSERT] Add created_by and updated_by
     cur.execute("""
-        INSERT INTO knowledge_node (parent_id, title, node_type, slug, structured_data, embedding)
-        VALUES (%s, %s, %s, %s, %s, %s)
+        INSERT INTO knowledge_node (parent_id, title, node_type, slug, structured_data, embedding, created_by, updated_by)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
     """, (
         parent_id, title, node_type, slug, 
         json.dumps({**new_struct, "explanation": narrative}),
-        vector # Save the vector immediately
+        vector,
+        user_email, # created_by
+        user_email  # updated_by
     ))
     
     return str(cur.fetchone()[0]), "created_new"
 
 
-def resolve_parent(cur, parent_node_data):
+def resolve_parent(cur, parent_node_data, user_email):
     """
-    Robust Parent Resolver:
-    1. If linking to ID -> Verify ID exists.
-    2. If creating new -> Check if Title exists (Case Insensitive).
-       - If yes -> Return EXISTING ID (Prevent Duplicate).
-       - If no -> Create NEW Parent.
+    Resolves Parent ID.
+    Now tracks created_by / updated_by for new parents.
     """
     action = parent_node_data.get('action')
     title = parent_node_data.get('title', '').strip()
@@ -168,50 +162,43 @@ def resolve_parent(cur, parent_node_data):
     # CASE 1: Explicit Link by ID
     if action == 'link_existing' and parent_node_data.get('id'):
         parent_id = parent_node_data.get('id')
-        # Verification: Does this ID actually exist?
         cur.execute("SELECT id FROM knowledge_node WHERE id = %s", (parent_id,))
         if cur.fetchone():
             return str(parent_id)
-        else:
-            print(f"⚠️ Warning: Parent ID {parent_id} not found. Falling back to title search.")
 
-    # CASE 2: Search by Title (Prevent Duplicates)
-    # We use ILIKE for case-insensitive matching (e.g., "Finance" == "finance")
+    # CASE 2: Search by Title
     cur.execute("""
         SELECT id FROM knowledge_node 
         WHERE title ILIKE %s AND node_type = 'domain'
     """, (title,))
     
     existing = cur.fetchone()
-    
     if existing:
-        print(f"✅ Found existing Parent '{title}'. Linking to ID: {existing[0]}")
         return str(existing[0])
 
-    # CASE 3: Truly New Parent
+    # CASE 3: Create New Parent
     print(f"🆕 Creating NEW Parent Domain: '{title}'")
-    
-    # Generate embedding for the parent
     narrative = parent_node_data.get('narrative', '')
     slug = parent_node_data.get('slug')
     node_type = parent_node_data.get('node_type', 'domain')
     vector = generate_embedding(f"{title}: {narrative}")
     
+    # [INSERT] Add created_by and updated_by
     cur.execute("""
-        INSERT INTO knowledge_node (title, node_type, slug, structured_data, embedding)
-        VALUES (%s, %s, %s, %s, %s, %s)
+        INSERT INTO knowledge_node (title, node_type, slug, structured_data, embedding, created_by, updated_by)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
     """, (
         title, 
         node_type, 
         slug, 
         json.dumps({"explanation": narrative}),
-        vector
+        vector,
+        user_email,
+        user_email
     ))
     
     return str(cur.fetchone()[0])
-
-
 
 
 # --- Check Existence Route (Global Search) ---
@@ -314,6 +301,12 @@ def check_existence():
 @app.route('/api/knowledge/store-structure', methods=['POST'])
 def store_structure():
     data = request.json
+    
+    # 1. Get User Email (Required)
+    user_email = data.get('user_email')
+    if not user_email:
+        return jsonify({"success": False, "error": "Missing 'user_email' in payload"}), 400
+
     id_map = {}
     report_log = [] 
     
@@ -321,14 +314,14 @@ def store_structure():
         with psycopg.connect(DB_DSN) as conn:
             with conn.cursor() as cur:
                 
-                # --- Step A: Handle the Parent/Root (Safe Resolve) ---
+                # --- Step A: Parent ---
                 p_node = data.get('parent_node')
-                root_id = resolve_parent(cur, p_node) 
+                # Pass user_email
+                root_id = resolve_parent(cur, p_node, user_email) 
                 
-                # Save mapping so keywords/children can find it
                 id_map[p_node['temp_id']] = root_id
 
-                # --- Step B: Handle Children Nodes (Smart Merge) ---
+                # --- Step B: Children ---
                 nodes = data.get('nodes', [])
                 for node in nodes:
                     temp_parent = node.get('parent_temp_id')
@@ -337,23 +330,23 @@ def store_structure():
                     if not real_parent_id:
                         raise ValueError(f"Parent temp_id '{temp_parent}' not resolved.")
 
-                    # Call Smart Function
+                    # Pass user_email
                     real_child_id, status = smart_merge_or_create(
                         cur, 
                         real_parent_id, 
-                        node
+                        node,
+                        user_email 
                     )
                     
                     id_map[node['temp_id']] = real_child_id
                     
-                    # Log result
                     report_log.append({
                         "title": node['title'],
                         "status": status,
                         "id": real_child_id
                     })
 
-                    # Handle Attachments (Optional)
+                    # Handle Attachments (Optional: Add created_by if table supports it)
                     attachments = node.get('attachments', [])
                     for att in attachments:
                         cur.execute("""
@@ -361,47 +354,31 @@ def store_structure():
                             VALUES (%s, %s, %s, %s)
                         """, (real_child_id, att['name'], att['type'], att['path']))
 
-                # --- Step C: Keywords ---
+                # --- Step C: Keywords (No change needed usually, or add created_by if desired) ---
                 keywords = data.get('keywords', [])
                 for kw in keywords:
-                    # 1. Insert Keyword or Update Synonyms
                     cur.execute("""
-                        INSERT INTO keyword (label, synonyms) 
-                        VALUES (%s, %s)
-                        ON CONFLICT (label) 
-                        DO UPDATE SET synonyms = EXCLUDED.synonyms
+                        INSERT INTO keyword (label, synonyms) VALUES (%s, %s)
+                        ON CONFLICT (label) DO UPDATE SET synonyms = EXCLUDED.synonyms
                         RETURNING id
-                    """, (
-                        kw['label'], 
-                        json.dumps(kw.get('synonyms', []))
-                    ))
-                    
+                    """, (kw['label'], json.dumps(kw.get('synonyms', []))))
                     keyword_id = cur.fetchone()[0]
 
-                    # 2. Link to Nodes using ID Map
-                    node_temps = kw.get('node_temp_ids', [])
-                    weight = kw.get('weight', 1.0)
-                    
-                    for temp_id in node_temps:
+                    for temp_id in kw.get('node_temp_ids', []):
                         real_node_id = id_map.get(temp_id)
-                        
                         if real_node_id:
                             cur.execute("""
                                 INSERT INTO node_keyword (node_id, keyword_id, weight)
                                 VALUES (%s, %s, %s)
-                                ON CONFLICT (node_id, keyword_id) 
-                                DO UPDATE SET weight = EXCLUDED.weight
-                            """, (real_node_id, keyword_id, weight))
+                                ON CONFLICT (node_id, keyword_id) DO UPDATE SET weight = EXCLUDED.weight
+                            """, (real_node_id, keyword_id, kw.get('weight', 1.0)))
 
-                # --- Step D: Relationships (Edges) ---
+                # --- Step D: Relationships ---
                 relationships = data.get('relationships', [])
                 for rel in relationships:
                     source_id = id_map.get(rel['source_temp_id'])
                     target_id = id_map.get(rel['target_temp_id'])
-                    
-                    # Only create edge if both nodes exist in this batch/context
                     if source_id and target_id:
-                        # Optional: Check for existing edge to prevent duplicates
                         cur.execute("""
                             SELECT id FROM knowledge_edge 
                             WHERE source_node_id = %s AND target_node_id = %s AND relation_type = %s
@@ -411,17 +388,11 @@ def store_structure():
                             cur.execute("""
                                 INSERT INTO knowledge_edge (source_node_id, target_node_id, relation_type, description)
                                 VALUES (%s, %s, %s, %s)
-                            """, (
-                                source_id, 
-                                target_id, 
-                                rel['relation_type'], 
-                                rel.get('description')
-                            ))
+                            """, (source_id, target_id, rel['relation_type'], rel.get('description')))
 
             conn.commit()
 
-        # Launch background embeddings (Threaded)
-        # Collect all IDs created or resolved
+        # Background Embeddings
         all_affected_ids = list(id_map.values())
         thread = threading.Thread(target=run_embedding_job, args=(all_affected_ids,))
         thread.start()
