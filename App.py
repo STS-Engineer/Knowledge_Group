@@ -186,7 +186,7 @@ def resolve_parent(cur, parent_node_data, user_email):
     # [INSERT] Add created_by and updated_by
     cur.execute("""
         INSERT INTO knowledge_node (title, node_type, slug, structured_data, embedding, created_by, updated_by)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
         RETURNING id
     """, (
         title, 
