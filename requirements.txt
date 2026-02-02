@@ -2,3 +2,4 @@ flask
 psycopg 
 openai 
 python-dotenv
+requests

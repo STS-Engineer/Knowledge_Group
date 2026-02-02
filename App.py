@@ -5,6 +5,11 @@ from flask import Flask, request, jsonify
 import psycopg
 from openai import OpenAI
 from dotenv import load_dotenv
+import time
+import uuid
+import base64
+import requests
+from werkzeug.utils import secure_filename
 
 # Load env variables (Ensure DATABASE_URL and OPENAI_API_KEY are in .env)
 load_dotenv()
@@ -406,6 +411,157 @@ def store_structure():
     except Exception as e:
         print(f"Error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+
+
+
+#========================================================================================================================
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'pdf', 'txt', 'csv', 'xlsx', 'docx', 'pptx', 'md', 'json'}
+
+def allowed_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+# --- Helper: Upload Bytes to GitHub ---
+def upload_bytes_to_github(file_content_bytes, filename, folder_path="uploads"):
+    """
+    Uploads raw bytes to GitHub and returns the file path.
+    """
+    try:
+        # 1. Config
+        token = os.getenv("GITHUB_TOKEN")
+        repo_full_name = "STS-Engineer/Knowledge_Group"
+        branch = "main"
+        
+        if not token:
+            return {"success": False, "error": "GITHUB_TOKEN not set"}
+
+        # 2. Encode Content
+        content_b64 = base64.b64encode(file_content_bytes).decode('utf-8')
+
+        # 3. Construct Unique Path
+        # We add a UUID/Timestamp prefix to ensure uniqueness in the folder
+        unique_filename = f"{uuid.uuid4().hex[:8]}_{int(time.time())}_{filename}"
+        file_path_in_repo = f"{folder_path}/{unique_filename}"
+        
+        api_url = f"https://api.github.com/repos/{repo_full_name}/contents/{file_path_in_repo}"
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        
+        payload = {
+            "message": f"Upload attachment: {unique_filename}",
+            "content": content_b64,
+            "branch": branch
+        }
+
+        # 4. Send Request
+        response = requests.put(api_url, headers=headers, json=payload, timeout=20)
+        
+        if response.status_code in [200, 201]:
+            data = response.json()
+            # Return the path you requested: uploads/filename.ext
+            return {
+                "success": True,
+                "path": file_path_in_repo, 
+                "raw_url": data.get('content', {}).get('download_url')
+            }
+        else:
+            return {"success": False, "error": f"GitHub {response.status_code}: {response.text}"}
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# --- Route: Upload from OpenAI References (No DB Insert) ---
+@app.route('/api/knowledge/upload-attachment', methods=['POST'])
+def upload_attachment():
+    """
+    1. Receives list of file references.
+    2. Downloads content.
+    3. Uploads to GitHub.
+    4. Returns the GitHub paths (NO DB INSERTION).
+    """
+    # 1. Parse Request
+    data = request.get_json(silent=True) or {}
+    refs = data.get('openaiFileIdRefs', [])
+
+    if not refs:
+        return jsonify({"message": "No openaiFileIdRefs provided"}), 400
+
+    uploaded_results = []
+    errors = []
+
+    # 2. Process Each File
+    for file_ref in refs:
+        try:
+            # Extract info
+            if isinstance(file_ref, dict):
+                download_link = file_ref.get('download_link')
+                original_name = file_ref.get('name') or 'uploaded_file'
+            else:
+                download_link = file_ref
+                original_name = 'uploaded_file'
+
+            if not download_link:
+                continue
+
+            # A. Download Content
+            print(f"⬇️ Downloading: {original_name}")
+            r = requests.get(download_link, stream=False, timeout=15)
+            r.raise_for_status()
+            file_bytes = r.content
+
+            # B. Validate Type
+            filename_safe = secure_filename(original_name)
+            if '.' not in filename_safe: 
+                filename_safe += ".bin"
+            
+            if not allowed_file(filename_safe):
+                errors.append(f"{original_name}: File type not allowed")
+                continue
+
+            # C. Upload to GitHub
+            # This defaults to "uploads/" folder as requested
+            gh_result = upload_bytes_to_github(file_bytes, filename_safe, folder_path="uploads")
+            
+            if not gh_result['success']:
+                errors.append(f"{original_name}: {gh_result['error']}")
+                continue
+
+            # D. Collect Result (No DB Insert)
+            uploaded_results.append({
+                "original_name": original_name,
+                "path": gh_result['path'],      # e.g., "uploads/unique_id_file.pdf"
+                "url": gh_result['raw_url']     # The direct download link
+            })
+
+        except Exception as e:
+            print(f"❌ Error processing {original_name}: {e}")
+            errors.append(f"System Error for {original_name}: {str(e)}")
+
+    # 3. Final Response
+    if not uploaded_results and errors:
+        return jsonify({"success": False, "message": "All uploads failed", "errors": errors}), 500
+
+    return jsonify({
+        "success": True,
+        "message": f"Processed {len(uploaded_results)} files.",
+        "files": uploaded_results,
+        "errors": errors
+    }), 200
+
+
+
+
+
+
+
+
+
+
+
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
