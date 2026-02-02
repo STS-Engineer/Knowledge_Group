@@ -19,11 +19,6 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Database connection string
 DB_DSN = "postgresql://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/knowledge_DB"
-SIMILARITY_THRESHOLD_DUPLICATE = 0.95  # It's the same thing
-SIMILARITY_THRESHOLD_PARENT_MATCH = 0.92 
-SIMILARITY_THRESHOLD_UPDATE = 0.88
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'pdf', 'txt', 'csv', 'xlsx', 'docx', 'pptx', 'md', 'json'}
-
 
 # --- Helper: Embedding Generation ---
 def generate_embedding(text):
@@ -37,8 +32,6 @@ def generate_embedding(text):
     except Exception as e:
         print(f"⚠️ OpenAI Error: {e}")
         return None
-
-
 
 # --- Background Task: Update Embeddings ---
 def run_embedding_job(node_ids):
@@ -74,69 +67,14 @@ def run_embedding_job(node_ids):
         print(f"❌ Background job failed: {e}")
 
 
-
-# --- Helper: Logic for Node Creation/Merge ---
-def resolve_parent(cur, parent_node_data, user_email):
-    """
-    Resolves Parent ID. 
-    INSERT Modification: Only sets 'created_by'.
-    """
-    action = parent_node_data.get('action')
-    title = parent_node_data.get('title', '').strip()
-    narrative = parent_node_data.get('narrative', '')
-    
-    # 1. Explicit Link by ID
-    if action == 'link_existing' and parent_node_data.get('id'):
-        return str(parent_node_data.get('id'))
-
-    # 2. Text Search (Exact Match)
-    cur.execute("SELECT id FROM knowledge_node WHERE title ILIKE %s AND node_type = 'domain'", (title,))
-    existing = cur.fetchone()
-    if existing:
-        return str(existing[0])
-
-    # 3. Vector Search (Semantic Match)
-    vector = generate_embedding(f"{title}: {narrative}")
-    if vector:
-        cur.execute("""
-            SELECT id, title, 1 - (embedding <=> %s::vector) as similarity
-            FROM knowledge_node 
-            WHERE node_type = 'domain'
-            ORDER BY similarity DESC 
-            LIMIT 1
-        """, (vector,))
-        match = cur.fetchone()
-        
-        if match and match[2] > SIMILARITY_THRESHOLD_PARENT_MATCH:
-            print(f"🔗 Linked Parent by Vector (Sim: {match[2]:.4f}): '{title}' -> Existing '{match[1]}'")
-            return str(match[0])
-
-    # 4. Create NEW Parent
-    print(f"🆕 Creating NEW Parent Domain: '{title}'")
-    slug = parent_node_data.get('slug')
-    node_type = parent_node_data.get('node_type', 'domain')
-    
-    # [FIX] Insert only created_by. updated_by is omitted.
-    cur.execute("""
-        INSERT INTO knowledge_node (title, node_type, slug, structured_data, embedding, created_by)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        RETURNING id
-    """, (
-        title, 
-        node_type, 
-        slug, 
-        json.dumps({"explanation": narrative}),
-        vector,
-        user_email # Only created_by
-    ))
-    
-    return str(cur.fetchone()[0])
-
-
+# --- CONSTANTS ---
+SIMILARITY_THRESHOLD_DUPLICATE = 0.95  # It's the same thing
+SIMILARITY_THRESHOLD_MERGE = 0.85      # It's related, check for new details
 
 def smart_merge_or_create(cur, parent_id, node_data, user_email):
     """
-    Decides whether to UPDATE an existing child or INSERT a new one.
+    Intelligent logic to Check, Match, and Insert/Merge.
+    Now tracks created_by / updated_by.
     """
     title = node_data['title']
     narrative = node_data.get('narrative', '')
@@ -146,132 +84,137 @@ def smart_merge_or_create(cur, parent_id, node_data, user_email):
 
     # 1. Generate Embedding
     vector = generate_embedding(f"{title}: {narrative}")
-
-    # 2. Search Siblings (Vector Similarity)
-    match = None
-    if vector:
-        cur.execute("""
-            SELECT id, title, structured_data, 1 - (embedding <=> %s::vector) as similarity
-            FROM knowledge_node 
-            WHERE parent_id = %s 
-            ORDER BY similarity DESC 
-            LIMIT 1
-        """, (vector, parent_id))
-        match = cur.fetchone()
-
-    # CASE A: UPDATE (High Similarity)
-    if match and match[3] > SIMILARITY_THRESHOLD_UPDATE:
-        existing_id, existing_title, existing_struct, similarity = match
-        print(f"🔄 Updating Node (Sim: {similarity:.4f}): '{title}' replacing '{existing_title}'")
-
-        merged_struct = existing_struct.copy() if existing_struct else {}
-        merged_struct.update(new_struct)
-        merged_struct['explanation'] = narrative
-
-        # Update: Set updated_by, keep created_by intact
-        cur.execute("""
-            UPDATE knowledge_node 
-            SET title = %s,
-                slug = %s,
-                structured_data = %s, 
-                embedding = %s,
-                updated_at = NOW(),
-                updated_by = %s
-            WHERE id = %s
-        """, (
-            title, 
-            slug,
-            json.dumps(merged_struct), 
-            vector,
-            user_email, # Set updated_by
-            existing_id
-        ))
-        return str(existing_id), f"updated_existing_node"
-
-    # CASE B: INSERT (New Content)
-    print(f"➕ Inserting New Node: '{title}'")
     
-    # [FIX] Insert only created_by. updated_by is omitted.
+    # Fallback to simple title match if OpenAI fails
+    if not vector:
+        cur.execute("SELECT id FROM knowledge_node WHERE title = %s AND parent_id = %s", (title, parent_id))
+        res = cur.fetchone()
+        if res: return str(res[0]), "exists_title_match"
+
+    # 2. Vector Search against SIBLINGS
     cur.execute("""
-        INSERT INTO knowledge_node (parent_id, title, node_type, slug, structured_data, embedding, created_by)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        SELECT id, title, structured_data, 1 - (embedding <=> %s::vector) as similarity
+        FROM knowledge_node 
+        WHERE parent_id = %s 
+        ORDER BY similarity DESC 
+        LIMIT 1
+    """, (vector, parent_id))
+    
+    match = cur.fetchone()
+    
+    # --- LOGIC DECISION TREE ---
+    if match:
+        existing_id, existing_title, existing_struct, similarity = match
+        
+        # SCENARIO A: DUPLICATE
+        if similarity > SIMILARITY_THRESHOLD_DUPLICATE:
+            return str(existing_id), f"skipped_duplicate_of_{existing_title}"
+
+        # SCENARIO B: MERGE CANDIDATE
+        if similarity > SIMILARITY_THRESHOLD_MERGE:
+            merged_struct = existing_struct.copy()
+            updated = False
+            
+            for key, val in new_struct.items():
+                if key not in merged_struct:
+                    merged_struct[key] = val
+                    updated = True
+                elif isinstance(val, list) and isinstance(merged_struct[key], list):
+                    current_set = set(merged_struct[key])
+                    for item in val:
+                        if item not in current_set:
+                            merged_struct[key].append(item)
+                            updated = True
+            
+            if updated:
+                # [UPDATE] Add updated_by and updated_at
+                cur.execute("""
+                    UPDATE knowledge_node 
+                    SET structured_data = %s, 
+                        updated_at = NOW(),
+                        updated_by = %s
+                    WHERE id = %s
+                """, (json.dumps(merged_struct), user_email, existing_id))
+                return str(existing_id), f"merged_new_info_into_{existing_title}"
+            else:
+                return str(existing_id), f"skipped_no_new_info_vs_{existing_title}"
+
+    # SCENARIO C: NEW CONTENT (Insert)
+    # [INSERT] Add created_by and updated_by
+    cur.execute("""
+        INSERT INTO knowledge_node (parent_id, title, node_type, slug, structured_data, embedding, created_by, updated_by)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
     """, (
-        parent_id, 
-        title, 
-        node_type, 
-        slug, 
+        parent_id, title, node_type, slug, 
         json.dumps({**new_struct, "explanation": narrative}),
         vector,
-        user_email # Only created_by
+        user_email, # created_by
+        user_email  # updated_by
     ))
     
     return str(cur.fetchone()[0]), "created_new"
 
 
-
-# --- Helper: File Uploads ---
-def allowed_file(filename):
-    return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-
-
-def upload_bytes_to_github(file_content_bytes, filename, folder_path="uploads"):
+def resolve_parent(cur, parent_node_data, user_email):
     """
-    Uploads raw bytes to GitHub and returns the file path and raw URL.
+    Resolves Parent ID.
+    Now tracks created_by / updated_by for new parents.
     """
-    try:
-        # 1. Config
-        token = os.getenv("GITHUB_TOKEN")
-        repo_full_name = "STS-Engineer/Knowledge_Group" # Hardcoded based on your prompt
-        branch = "main"
-        
-        if not token:
-            return {"success": False, "error": "GITHUB_TOKEN not set"}
+    action = parent_node_data.get('action')
+    title = parent_node_data.get('title', '').strip()
+    
+    # CASE 1: Explicit Link by ID
+    if action == 'link_existing' and parent_node_data.get('id'):
+        parent_id = parent_node_data.get('id')
+        cur.execute("SELECT id FROM knowledge_node WHERE id = %s", (parent_id,))
+        if cur.fetchone():
+            return str(parent_id)
 
-        # 2. Encode Content
-        content_b64 = base64.b64encode(file_content_bytes).decode('utf-8')
+    # CASE 2: Search by Title
+    cur.execute("""
+        SELECT id FROM knowledge_node 
+        WHERE title ILIKE %s AND node_type = 'domain'
+    """, (title,))
+    
+    existing = cur.fetchone()
+    if existing:
+        return str(existing[0])
 
-        # 3. Construct Unique Path
-        unique_filename = f"{uuid.uuid4().hex[:8]}_{int(time.time())}_{filename}"
-        file_path_in_repo = f"{folder_path}/{unique_filename}"
-        
-        api_url = f"https://api.github.com/repos/{repo_full_name}/contents/{file_path_in_repo}"
-        headers = {
-            "Authorization": f"token {token}",
-            "Accept": "application/vnd.github.v3+json",
-        }
-        
-        payload = {
-            "message": f"Upload attachment: {unique_filename}",
-            "content": content_b64,
-            "branch": branch
-        }
-
-        # 4. Send Request
-        response = requests.put(api_url, headers=headers, json=payload, timeout=20)
-        
-        if response.status_code in [200, 201]:
-            data = response.json()
-            return {
-                "success": True,
-                "path": file_path_in_repo, 
-                "raw_url": data.get('content', {}).get('download_url')
-            }
-        else:
-            return {"success": False, "error": f"GitHub {response.status_code}: {response.text}"}
-
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
+    # CASE 3: Create New Parent
+    print(f"🆕 Creating NEW Parent Domain: '{title}'")
+    narrative = parent_node_data.get('narrative', '')
+    slug = parent_node_data.get('slug')
+    node_type = parent_node_data.get('node_type', 'domain')
+    vector = generate_embedding(f"{title}: {narrative}")
+    
+    # [INSERT] Add created_by and updated_by
+    cur.execute("""
+        INSERT INTO knowledge_node (title, node_type, slug, structured_data, embedding, created_by, updated_by)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+    """, (
+        title, 
+        node_type, 
+        slug, 
+        json.dumps({"explanation": narrative}),
+        vector,
+        user_email,
+        user_email
+    ))
+    
+    return str(cur.fetchone()[0])
 
 
-# --- ROUTES ---
+# --- Check Existence Route (Global Search) ---
 @app.route('/api/knowledge/check-existence', methods=['POST'])
 def check_existence():
     """
     Checks if a node exists globally based on Title (Exact/Fuzzy) and Content (Vector Similarity).
+    Input: { 
+        "title": "string", 
+        "structured_data": { ... }
+    }
     """
     data = request.json
     title = data.get('title', '').strip()
@@ -294,6 +237,7 @@ def check_existence():
             with conn.cursor() as cur:
                 
                 # --- A. Check Exact Title Match (Global) ---
+                # We want to know if this title exists anywhere
                 cur.execute(
                     "SELECT id, title, parent_id FROM knowledge_node WHERE title ILIKE %s", 
                     (title,)
@@ -301,6 +245,7 @@ def check_existence():
                 title_match = cur.fetchone()
 
                 # --- B. Check Vector Similarity (Global) ---
+                # Finds the closest semantic match in the entire database
                 cur.execute("""
                     SELECT id, title, parent_id, 1 - (embedding <=> %s::vector) as similarity
                     FROM knowledge_node 
@@ -340,7 +285,7 @@ def check_existence():
                             "similarity": round(sim_score, 4),
                             "reason": "Content is semantically identical"
                         }
-                    elif sim_score > SIMILARITY_THRESHOLD_UPDATE:
+                    elif sim_score > SIMILARITY_THRESHOLD_MERGE:
                         response["exists"] = True 
                         response["status"] = "merge_candidate"
                         response["match_details"] = {
@@ -357,11 +302,13 @@ def check_existence():
         return jsonify({"error": str(e)}), 500
 
 
+# --- Main Route: Store Structure ---
 @app.route('/api/knowledge/store-structure', methods=['POST'])
 def store_structure():
     data = request.json
-    user_email = data.get('user_email')
     
+    # 1. Get User Email (Required)
+    user_email = data.get('user_email')
     if not user_email:
         return jsonify({"success": False, "error": "Missing 'user_email' in payload"}), 400
 
@@ -372,39 +319,47 @@ def store_structure():
         with psycopg.connect(DB_DSN) as conn:
             with conn.cursor() as cur:
                 
-                # 1. Resolve Parent
+                # --- Step A: Parent ---
                 p_node = data.get('parent_node')
-                root_id = resolve_parent(cur, p_node, user_email)
+                # Pass user_email
+                root_id = resolve_parent(cur, p_node, user_email) 
+                
                 id_map[p_node['temp_id']] = root_id
 
-                # 2. Process Nodes
+                # --- Step B: Children ---
                 nodes = data.get('nodes', [])
                 for node in nodes:
                     temp_parent = node.get('parent_temp_id')
                     real_parent_id = id_map.get(temp_parent)
                     
                     if not real_parent_id:
-                        if temp_parent == p_node['temp_id']:
-                            real_parent_id = root_id
-                        else:
-                            raise ValueError(f"Parent temp_id '{temp_parent}' not resolved.")
+                        raise ValueError(f"Parent temp_id '{temp_parent}' not resolved.")
 
+                    # Pass user_email
                     real_child_id, status = smart_merge_or_create(
-                        cur, real_parent_id, node, user_email
+                        cur, 
+                        real_parent_id, 
+                        node,
+                        user_email 
                     )
                     
                     id_map[node['temp_id']] = real_child_id
-                    report_log.append({"title": node['title'], "status": status, "id": real_child_id})
+                    
+                    report_log.append({
+                        "title": node['title'],
+                        "status": status,
+                        "id": real_child_id
+                    })
 
-                    # Handle Attachments (Metadata only, file content is already uploaded)
+                    # Handle Attachments (Optional: Add created_by if table supports it)
                     attachments = node.get('attachments', [])
                     for att in attachments:
                         cur.execute("""
-                            INSERT INTO knowledge_attachment (node_id, file_name, file_path, created_by)
+                            INSERT INTO knowledge_attachment (node_id, file_name, file_type, file_path)
                             VALUES (%s, %s, %s, %s)
-                        """, (real_child_id, att.get('name'), att.get('path'), user_email))
+                        """, (real_child_id, att['name'], att['type'], att['path']))
 
-                # 3. Handle Keywords
+                # --- Step C: Keywords (No change needed usually, or add created_by if desired) ---
                 keywords = data.get('keywords', [])
                 for kw in keywords:
                     cur.execute("""
@@ -423,7 +378,7 @@ def store_structure():
                                 ON CONFLICT (node_id, keyword_id) DO UPDATE SET weight = EXCLUDED.weight
                             """, (real_node_id, keyword_id, kw.get('weight', 1.0)))
 
-                # 4. Handle Relationships
+                # --- Step D: Relationships ---
                 relationships = data.get('relationships', [])
                 for rel in relationships:
                     source_id = id_map.get(rel['source_temp_id'])
@@ -458,14 +413,77 @@ def store_structure():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+
+
+
+#========================================================================================================================
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'pdf', 'txt', 'csv', 'xlsx', 'docx', 'pptx', 'md', 'json'}
+
+def allowed_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+# --- Helper: Upload Bytes to GitHub ---
+def upload_bytes_to_github(file_content_bytes, filename, folder_path="uploads"):
+    """
+    Uploads raw bytes to GitHub and returns the file path.
+    """
+    try:
+        # 1. Config
+        token = os.getenv("GITHUB_TOKEN")
+        repo_full_name = "STS-Engineer/Knowledge_Group"
+        branch = "main"
+        
+        if not token:
+            return {"success": False, "error": "GITHUB_TOKEN not set"}
+
+        # 2. Encode Content
+        content_b64 = base64.b64encode(file_content_bytes).decode('utf-8')
+
+        # 3. Construct Unique Path
+        # We add a UUID/Timestamp prefix to ensure uniqueness in the folder
+        unique_filename = f"{uuid.uuid4().hex[:8]}_{int(time.time())}_{filename}"
+        file_path_in_repo = f"{folder_path}/{unique_filename}"
+        
+        api_url = f"https://api.github.com/repos/{repo_full_name}/contents/{file_path_in_repo}"
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        
+        payload = {
+            "message": f"Upload attachment: {unique_filename}",
+            "content": content_b64,
+            "branch": branch
+        }
+
+        # 4. Send Request
+        response = requests.put(api_url, headers=headers, json=payload, timeout=20)
+        
+        if response.status_code in [200, 201]:
+            data = response.json()
+            # Return the path you requested: uploads/filename.ext
+            return {
+                "success": True,
+                "path": file_path_in_repo, 
+                "raw_url": data.get('content', {}).get('download_url')
+            }
+        else:
+            return {"success": False, "error": f"GitHub {response.status_code}: {response.text}"}
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# --- Route: Upload from OpenAI References (No DB Insert) ---
 @app.route('/api/knowledge/upload-attachment', methods=['POST'])
 def upload_attachment():
     """
-    1. Receives list of file references (OpenAI refs).
+    1. Receives list of file references.
     2. Downloads content.
     3. Uploads to GitHub.
     4. Returns the GitHub paths (NO DB INSERTION).
     """
+    # 1. Parse Request
     data = request.get_json(silent=True) or {}
     refs = data.get('openaiFileIdRefs', [])
 
@@ -475,6 +493,7 @@ def upload_attachment():
     uploaded_results = []
     errors = []
 
+    # 2. Process Each File
     for file_ref in refs:
         try:
             # Extract info
@@ -488,12 +507,13 @@ def upload_attachment():
             if not download_link:
                 continue
 
+            # A. Download Content
             print(f"⬇️ Downloading: {original_name}")
             r = requests.get(download_link, stream=False, timeout=15)
             r.raise_for_status()
             file_bytes = r.content
 
-            # Validate Type
+            # B. Validate Type
             filename_safe = secure_filename(original_name)
             if '.' not in filename_safe: 
                 filename_safe += ".bin"
@@ -502,24 +522,26 @@ def upload_attachment():
                 errors.append(f"{original_name}: File type not allowed")
                 continue
 
-            # Upload to GitHub
+            # C. Upload to GitHub
+            # This defaults to "uploads/" folder as requested
             gh_result = upload_bytes_to_github(file_bytes, filename_safe, folder_path="uploads")
             
             if not gh_result['success']:
                 errors.append(f"{original_name}: {gh_result['error']}")
                 continue
 
-            # Collect Result (No DB Insert)
+            # D. Collect Result (No DB Insert)
             uploaded_results.append({
                 "original_name": original_name,
-                "path": gh_result['path'], 
-                "url": gh_result['raw_url']
+                "path": gh_result['path'],      # e.g., "uploads/unique_id_file.pdf"
+                "url": gh_result['raw_url']     # The direct download link
             })
 
         except Exception as e:
             print(f"❌ Error processing {original_name}: {e}")
             errors.append(f"System Error for {original_name}: {str(e)}")
 
+    # 3. Final Response
     if not uploaded_results and errors:
         return jsonify({"success": False, "message": "All uploads failed", "errors": errors}), 500
 
@@ -529,6 +551,15 @@ def upload_attachment():
         "files": uploaded_results,
         "errors": errors
     }), 200
+
+
+
+
+
+
+
+
+
 
 
 
