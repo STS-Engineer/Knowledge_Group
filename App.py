@@ -423,15 +423,14 @@ def allowed_file(filename):
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# --- Helper: Upload Bytes to GitHub ---
 def upload_bytes_to_github(file_content_bytes, filename, folder_path="uploads"):
     """
-    Uploads raw bytes to GitHub and returns the file path.
+    Uploads raw bytes to GitHub and returns the file path and raw URL.
     """
     try:
         # 1. Config
         token = os.getenv("GITHUB_TOKEN")
-        repo_full_name = "STS-Engineer/Knowledge_Group"
+        repo_full_name = "STS-Engineer/Knowledge_Group" # Hardcoded based on your prompt
         branch = "main"
         
         if not token:
@@ -441,7 +440,6 @@ def upload_bytes_to_github(file_content_bytes, filename, folder_path="uploads"):
         content_b64 = base64.b64encode(file_content_bytes).decode('utf-8')
 
         # 3. Construct Unique Path
-        # We add a UUID/Timestamp prefix to ensure uniqueness in the folder
         unique_filename = f"{uuid.uuid4().hex[:8]}_{int(time.time())}_{filename}"
         file_path_in_repo = f"{folder_path}/{unique_filename}"
         
@@ -462,7 +460,6 @@ def upload_bytes_to_github(file_content_bytes, filename, folder_path="uploads"):
         
         if response.status_code in [200, 201]:
             data = response.json()
-            # Return the path you requested: uploads/filename.ext
             return {
                 "success": True,
                 "path": file_path_in_repo, 
@@ -473,17 +470,17 @@ def upload_bytes_to_github(file_content_bytes, filename, folder_path="uploads"):
 
     except Exception as e:
         return {"success": False, "error": str(e)}
+    
 
 # --- Route: Upload from OpenAI References (No DB Insert) ---
 @app.route('/api/knowledge/upload-attachment', methods=['POST'])
 def upload_attachment():
     """
-    1. Receives list of file references.
+    1. Receives list of file references (OpenAI refs).
     2. Downloads content.
     3. Uploads to GitHub.
     4. Returns the GitHub paths (NO DB INSERTION).
     """
-    # 1. Parse Request
     data = request.get_json(silent=True) or {}
     refs = data.get('openaiFileIdRefs', [])
 
@@ -493,7 +490,6 @@ def upload_attachment():
     uploaded_results = []
     errors = []
 
-    # 2. Process Each File
     for file_ref in refs:
         try:
             # Extract info
@@ -507,13 +503,12 @@ def upload_attachment():
             if not download_link:
                 continue
 
-            # A. Download Content
             print(f"⬇️ Downloading: {original_name}")
             r = requests.get(download_link, stream=False, timeout=15)
             r.raise_for_status()
             file_bytes = r.content
 
-            # B. Validate Type
+            # Validate Type
             filename_safe = secure_filename(original_name)
             if '.' not in filename_safe: 
                 filename_safe += ".bin"
@@ -522,26 +517,24 @@ def upload_attachment():
                 errors.append(f"{original_name}: File type not allowed")
                 continue
 
-            # C. Upload to GitHub
-            # This defaults to "uploads/" folder as requested
+            # Upload to GitHub
             gh_result = upload_bytes_to_github(file_bytes, filename_safe, folder_path="uploads")
             
             if not gh_result['success']:
                 errors.append(f"{original_name}: {gh_result['error']}")
                 continue
 
-            # D. Collect Result (No DB Insert)
+            # Collect Result (No DB Insert)
             uploaded_results.append({
                 "original_name": original_name,
-                "path": gh_result['path'],      # e.g., "uploads/unique_id_file.pdf"
-                "url": gh_result['raw_url']     # The direct download link
+                "path": gh_result['path'], 
+                "url": gh_result['raw_url']
             })
 
         except Exception as e:
             print(f"❌ Error processing {original_name}: {e}")
             errors.append(f"System Error for {original_name}: {str(e)}")
 
-    # 3. Final Response
     if not uploaded_results and errors:
         return jsonify({"success": False, "message": "All uploads failed", "errors": errors}), 500
 
@@ -551,7 +544,6 @@ def upload_attachment():
         "files": uploaded_results,
         "errors": errors
     }), 200
-
 
 
 
