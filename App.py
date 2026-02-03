@@ -472,6 +472,18 @@ def upload_bytes_to_github(file_content_bytes, filename, folder_path="uploads"):
         return {"success": False, "error": str(e)}
     
 
+def download_from_openai_file_id(file_id):
+    """
+    Downloads file bytes from OpenAI Files API using file_id.
+    """
+    try:
+        print(f"⬇️ Downloading from OpenAI file_id: {file_id}")
+        response = client.files.content(file_id)
+        return response.read()
+    except Exception as e:
+        raise RuntimeError(f"OpenAI download failed for {file_id}: {e}")
+
+
 # --- Route: Upload from OpenAI References (No DB Insert) ---
 @app.route('/api/knowledge/upload-attachment', methods=['POST'])
 def upload_attachment():
@@ -492,48 +504,68 @@ def upload_attachment():
 
     for file_ref in refs:
         try:
-            # Extract info
+            # --- Normalize input ---
             if isinstance(file_ref, dict):
-                download_link = file_ref.get('download_link')
-                original_name = file_ref.get('name') or 'uploaded_file'
+                file_id = file_ref.get("id")
+                download_link = file_ref.get("download_link")
+                original_name = file_ref.get("name") or "uploaded_file"
+                mime_type = file_ref.get("mime_type")
             else:
-                download_link = file_ref
-                original_name = 'uploaded_file'
+                # If someone passed just a string, assume it's a file_id
+                file_id = file_ref
+                download_link = None
+                original_name = "uploaded_file"
+                mime_type = None
 
-            if not download_link:
+            if not file_id:
+                errors.append("Missing file_id in file reference")
                 continue
 
-            print(f"⬇️ Downloading: {original_name}")
-            r = requests.get(download_link, stream=False, timeout=15)
-            r.raise_for_status()
-            file_bytes = r.content
+            # --- Download bytes (LINK → FILE_ID fallback) ---
+            file_bytes = None
 
-            # Validate Type
+            if download_link:
+                try:
+                    print(f"⬇️ Trying download_link for {original_name}")
+                    r = requests.get(download_link, timeout=15)
+                    r.raise_for_status()
+                    file_bytes = r.content
+                except Exception as e:
+                    print(f"⚠️ download_link failed, falling back to file_id: {e}")
+
+            if file_bytes is None:
+                file_bytes = download_from_openai_file_id(file_id)
+
+            # --- Filename & validation ---
             filename_safe = secure_filename(original_name)
-            if '.' not in filename_safe: 
+            if '.' not in filename_safe:
                 filename_safe += ".bin"
-            
+
             if not allowed_file(filename_safe):
                 errors.append(f"{original_name}: File type not allowed")
                 continue
 
-            # Upload to GitHub
-            gh_result = upload_bytes_to_github(file_bytes, filename_safe, folder_path="uploads")
-            
-            if not gh_result['success']:
+            # --- Upload to GitHub ---
+            gh_result = upload_bytes_to_github(
+                file_bytes,
+                filename_safe,
+                folder_path="uploads"
+            )
+
+            if not gh_result["success"]:
                 errors.append(f"{original_name}: {gh_result['error']}")
                 continue
 
-            # Collect Result (No DB Insert)
             uploaded_results.append({
                 "original_name": original_name,
-                "path": gh_result['path'], 
-                "url": gh_result['raw_url']
+                "path": gh_result["path"],
+                "url": gh_result["raw_url"]
             })
 
         except Exception as e:
             print(f"❌ Error processing {original_name}: {e}")
-            errors.append(f"System Error for {original_name}: {str(e)}")
+            errors.append(f"{original_name}: {str(e)}")
+
 
     if not uploaded_results and errors:
         return jsonify({"success": False, "message": "All uploads failed", "errors": errors}), 500
