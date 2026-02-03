@@ -548,9 +548,39 @@ def upload_attachment():
 
 
 
+@app.route("/health", methods=["GET"])
+def health():
+    return {"ok": True}
 
+@app.route('/health-check', methods=['GET'])
+def health_check():
+    health_status = {
+        "status": "healthy",
+        "timestamp": time.ctime(),
+        "database": {"status": "unknown", "latency_ms": None},
+        "environment": {
+            "openai_api": "ok" if os.getenv("OPENAI_API_KEY") else "missing",
+            "github_token": "ok" if os.getenv("GITHUB_TOKEN") else "missing"
+        }
+    }
 
+    # Test Database connection and timing
+    start_time = time.time()
+    try:
+        # We set a short timeout so the health check doesn't hang if Azure is down
+        with psycopg.connect(DB_DSN, connect_timeout=3) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                health_status["database"]["status"] = "connected"
+                health_status["database"]["latency_ms"] = round((time.time() - start_time) * 1000, 2)
+    except Exception as e:
+        health_status["status"] = "unhealthy"
+        health_status["database"]["status"] = "disconnected"
+        health_status["database"]["error"] = str(e)
 
+    # If the DB is down, return 503 (Service Unavailable)
+    code = 200 if health_status["status"] == "healthy" else 503
+    return jsonify(health_status), code
 
 
 
