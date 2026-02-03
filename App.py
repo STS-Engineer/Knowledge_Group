@@ -357,7 +357,7 @@ def store_structure():
                         cur.execute("""
                             INSERT INTO knowledge_attachment (node_id, file_name, file_type, file_path)
                             VALUES (%s, %s, %s, %s)
-                        """, (real_child_id, att['name'], att['type'], att['path']))
+                        """, (real_child_id, att['name'], att.get('type', 'unknown'), att['path']))
 
                 # --- Step C: Keywords (No change needed usually, or add created_by if desired) ---
                 keywords = data.get('keywords', [])
