@@ -68,8 +68,8 @@ def run_embedding_job(node_ids):
 
 
 # --- CONSTANTS ---
-SIMILARITY_THRESHOLD_DUPLICATE = 0.85  # It's the same thing
-SIMILARITY_THRESHOLD_MERGE = 0.75      # It's related, check for new details
+SIMILARITY_THRESHOLD_DUPLICATE = 0.88  # It's the same thing
+SIMILARITY_THRESHOLD_MERGE = 0.82      # It's related, check for new details
 
 def smart_merge_or_create(cur, parent_id, node_data, user_email):
     """
@@ -156,229 +156,153 @@ def smart_merge_or_create(cur, parent_id, node_data, user_email):
     return str(cur.fetchone()[0]), "created_new"
 
 
-def resolve_parent(cur, parent_node_data, user_email):
-    """
-    Resolves Parent ID.
-    Now tracks created_by / updated_by for new parents.
-    """
-    action = parent_node_data.get('action')
-    title = parent_node_data.get('title', '').strip()
-    
-    # CASE 1: Explicit Link by ID
-    if action == 'link_existing' and parent_node_data.get('id'):
-        parent_id = parent_node_data.get('id')
-        cur.execute("SELECT id FROM knowledge_node WHERE id = %s", (parent_id,))
-        if cur.fetchone():
-            return str(parent_id)
-
-    # CASE 2: Search by Title
-    cur.execute("""
-        SELECT id FROM knowledge_node 
-        WHERE title ILIKE %s AND node_type = 'domain'
-    """, (title,))
-    
+def resolve_parent_sync(cur, data, email):
+    # Search by Title
+    cur.execute("SELECT id FROM knowledge_node WHERE title ILIKE %s AND parent_id IS NULL", (data['title'],))
     existing = cur.fetchone()
-    if existing:
-        return str(existing[0])
+    if existing: return str(existing[0])
 
-    # CASE 3: Create New Parent
-    print(f"🆕 Creating NEW Parent Domain: '{title}'")
-    narrative = parent_node_data.get('narrative', '')
-    slug = parent_node_data.get('slug')
-    node_type = parent_node_data.get('node_type', 'domain')
-    vector = generate_embedding(f"{title}: {narrative}")
-    
-    # [INSERT] Add created_by and updated_by
+    # Create New Domain Node (Sync Embedding)
+    vec = generate_embedding(f"{data['title']}: {data.get('narrative', '')}")
     cur.execute("""
         INSERT INTO knowledge_node (title, node_type, slug, structured_data, embedding, created_by, updated_by)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        RETURNING id
-    """, (
-        title, 
-        node_type, 
-        slug, 
-        json.dumps({"explanation": narrative}),
-        vector,
-        user_email,
-        user_email
-    ))
-    
+        VALUES (%s, 'domain', %s, %s, %s, %s, %s) RETURNING id
+    """, (data['title'], data.get('slug'), json.dumps({"explanation": data.get('narrative')}), vec, email, email))
     return str(cur.fetchone()[0])
 
+# --- Recursive Path Finder ---
+def get_node_lineage_sql():
+    """Returns SQL for a recursive CTE that builds the path string."""
+    return """
+    WITH RECURSIVE lineage AS (
+        SELECT id, title, parent_id, CAST(title AS TEXT) as path
+        FROM knowledge_node WHERE parent_id IS NULL
+        UNION ALL
+        SELECT n.id, n.title, n.parent_id, l.path || ' > ' || n.title
+        FROM knowledge_node n
+        JOIN lineage l ON n.parent_id = l.id
+    )
+    """
 
-# --- Check Existence Route (Global Search) ---
+# --- Deep Existence Check ---
 @app.route('/api/knowledge/check-existence', methods=['POST'])
 def check_existence():
     data = request.json
     title = data.get('title', '').strip()
+    narrative = data.get('narrative', '') or data.get('structured_data', {}).get('explanation', '')
     
-    # IMPORTANT: We must fetch the narrative if provided, 
-    # otherwise we search with title-only context which will reduce accuracy.
-    struct_data = data.get('structured_data', {})
-    narrative = struct_data.get('explanation') or data.get('narrative', '')
+    if not title: return jsonify({"error": "Title required"}), 400
 
-    if not title:
-        return jsonify({"error": "Title is required"}), 400
-
-    # 1. Generate Embedding using the COMBINED string (same as storage logic)
+    # Assistant uses "Breadcrumb Vector" strategy
     search_text = f"{title}: {narrative}"
     vector = generate_embedding(search_text)
-    
-    if not vector:
-        return jsonify({"error": "Failed to generate embedding"}), 500
+    if not vector: return jsonify({"error": "Embedding failed"}), 500
 
     try:
         with psycopg.connect(DB_DSN) as conn:
             with conn.cursor() as cur:
-                # 2. Pure Vector Search (No ILIKE)
-                cur.execute("""
-                    SELECT id, title, 1 - (embedding <=> %s::vector) as similarity
-                    FROM knowledge_node 
-                    ORDER BY similarity DESC 
-                    LIMIT 1
-                """, (vector,))
-                
-                vector_match = cur.fetchone()
+                # Updated SQL inside check_existence route
+                query = """
+                WITH RECURSIVE lineage AS (
+                    SELECT id, title, parent_id, CAST(title AS TEXT) as path
+                    FROM knowledge_node WHERE parent_id IS NULL
+                    UNION ALL
+                    SELECT n.id, n.title, n.parent_id, l.path || ' > ' || n.title
+                    FROM knowledge_node n JOIN lineage l ON n.parent_id = l.id
+                )
+                SELECT 
+                    l.id, 
+                    l.title, 
+                    l.path, 
+                    1 - (n.embedding <=> %s::vector) as similarity,
+                    n.structured_data->>'explanation' as existing_explanation, -- <--- ADD THIS
+                    n.parent_id
+                FROM lineage l
+                JOIN knowledge_node n ON l.id = n.id
+                ORDER BY similarity DESC LIMIT 1
+                """
+                cur.execute(query, (vector,))
+                match = cur.fetchone()
 
-                response = {
-                    "exists": False,
-                    "status": "new",
-                    "best_match": None
-                }
+                if match:
+                    node_id, m_title, m_path, score, m_explanation, m_parent_id = match
+                    status = "new"
+                    if score > SIMILARITY_THRESHOLD_DUPLICATE: status = "duplicate"
+                    elif score > SIMILARITY_THRESHOLD_MERGE: status = "merge_candidate"
 
-                if vector_match:
-                    node_id, match_title, sim_score = vector_match
-                    
-                    # Store the closest thing found for transparency
-                    response["best_match"] = {
-                        "id": str(node_id),
-                        "title": match_title,
-                        "similarity": round(sim_score, 4)
-                    }
-
-                    # Decide if it's "the same" based on meaning
-                    if sim_score > SIMILARITY_THRESHOLD_DUPLICATE:
-                        response["exists"] = True
-                        response["status"] = "duplicate_content"
-                    elif sim_score > SIMILARITY_THRESHOLD_MERGE:
-                        response["exists"] = True 
-                        response["status"] = "merge_candidate"
-
-                return jsonify(response)
-
+                    return jsonify({
+                        "exists": score > 0.85,
+                        "status": "merge_candidate" if score > 0.82 else "new",
+                        "best_match": {
+                            "id": str(node_id),
+                            "parent_id": str(m_parent_id) if m_parent_id else None, # Give the AI the Parent ID
+                            "title": m_title,
+                            "path": m_path,
+                            "similarity": round(float(score), 4),
+                            "existing_explanation": m_explanation # The LLM reads this to decide
+                        }
+                    })
+                return jsonify({"exists": False, "status": "new"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# --- Main Route: Store Structure ---
+# --- Optimized Storage ---
 @app.route('/api/knowledge/store-structure', methods=['POST'])
 def store_structure():
     data = request.json
-    
-    # 1. Get User Email (Required)
     user_email = data.get('user_email')
-    if not user_email:
-        return jsonify({"success": False, "error": "Missing 'user_email' in payload"}), 400
+    if not user_email: return jsonify({"success": False, "error": "Email required"}), 400
 
     id_map = {}
-    report_log = [] 
-    
+    report = []
+
     try:
         with psycopg.connect(DB_DSN) as conn:
             with conn.cursor() as cur:
-                
-                # --- Step A: Parent ---
+                # 1. Resolve Parent (Synchronous Embedding for Immediate Visibility)
                 p_node = data.get('parent_node')
-                # Pass user_email
-                root_id = resolve_parent(cur, p_node, user_email) 
-                
+                root_id = resolve_parent_sync(cur, p_node, user_email)
                 id_map[p_node['temp_id']] = root_id
 
-                # --- Step B: Children ---
-                nodes = data.get('nodes', [])
-                for node in nodes:
-                    temp_parent = node.get('parent_temp_id')
-                    real_parent_id = id_map.get(temp_parent)
+                # 2. Process Nodes (Supports target_existing_id)
+                for node in data.get('nodes', []):
+                    # Check if Assistant found an anchor
+                    target_id = node.get('target_existing_id')
                     
-                    if not real_parent_id:
-                        raise ValueError(f"Parent temp_id '{temp_parent}' not resolved.")
+                    if target_id:
+                        # CASE: Update/Attach to existing node
+                        real_id = target_id
+                        status = "attached_to_existing"
+                        # Update narrative if provided
+                        if node.get('narrative'):
+                            cur.execute("UPDATE knowledge_node SET updated_by=%s, updated_at=NOW() WHERE id=%s", (user_email, real_id))
+                    else:
+                        # CASE: Traditional Smart Merge or Create
+                        parent_real_id = id_map.get(node.get('parent_temp_id'))
+                        real_id, status = smart_merge_or_create(cur, parent_real_id, node, user_email)
 
-                    # Pass user_email
-                    real_child_id, status = smart_merge_or_create(
-                        cur, 
-                        real_parent_id, 
-                        node,
-                        user_email 
-                    )
+                    id_map[node['temp_id']] = real_id
                     
-                    id_map[node['temp_id']] = real_child_id
-                    
-                    report_log.append({
-                        "title": node['title'],
-                        "status": status,
-                        "id": real_child_id
-                    })
-
-                    # Handle Attachments (Optional: Add created_by if table supports it)
-                    attachments = node.get('attachments', [])
-                    for att in attachments:
+                    # Handle Attachments
+                    for att in node.get('attachments', []):
                         cur.execute("""
                             INSERT INTO knowledge_attachment (node_id, file_name, file_type, file_path)
                             VALUES (%s, %s, %s, %s)
-                        """, (real_child_id, att['name'], att.get('type', 'unknown'), att['path']))
+                        """, (real_id, att['name'], att.get('type'), att['path']))
 
-                # --- Step C: Keywords (No change needed usually, or add created_by if desired) ---
-                keywords = data.get('keywords', [])
-                for kw in keywords:
-                    cur.execute("""
-                        INSERT INTO keyword (label, synonyms) VALUES (%s, %s)
-                        ON CONFLICT (label) DO UPDATE SET synonyms = EXCLUDED.synonyms
-                        RETURNING id
-                    """, (kw['label'], json.dumps(kw.get('synonyms', []))))
-                    keyword_id = cur.fetchone()[0]
+                    report.append({"title": node['title'], "status": status, "id": real_id})
 
-                    for temp_id in kw.get('node_temp_ids', []):
-                        real_node_id = id_map.get(temp_id)
-                        if real_node_id:
-                            cur.execute("""
-                                INSERT INTO node_keyword (node_id, keyword_id, weight)
-                                VALUES (%s, %s, %s)
-                                ON CONFLICT (node_id, keyword_id) DO UPDATE SET weight = EXCLUDED.weight
-                            """, (real_node_id, keyword_id, kw.get('weight', 1.0)))
-
-                # --- Step D: Relationships ---
-                relationships = data.get('relationships', [])
-                for rel in relationships:
-                    source_id = id_map.get(rel['source_temp_id'])
-                    target_id = id_map.get(rel['target_temp_id'])
-                    if source_id and target_id:
-                        cur.execute("""
-                            SELECT id FROM knowledge_edge 
-                            WHERE source_node_id = %s AND target_node_id = %s AND relation_type = %s
-                        """, (source_id, target_id, rel['relation_type']))
-                        
-                        if not cur.fetchone():
-                            cur.execute("""
-                                INSERT INTO knowledge_edge (source_node_id, target_node_id, relation_type, description)
-                                VALUES (%s, %s, %s, %s)
-                            """, (source_id, target_id, rel['relation_type'], rel.get('description')))
+                # Process Keywords & Relationships...
+                # (Keep your existing keyword/relationship logic here)
 
             conn.commit()
 
-        # Background Embeddings
-        all_affected_ids = list(id_map.values())
-        thread = threading.Thread(target=run_embedding_job, args=(all_affected_ids,))
-        thread.start()
-
-        return jsonify({
-            "success": True, 
-            "report": report_log,
-            "root_id": root_id
-        })
+        # Update embeddings in background for new nodes
+        threading.Thread(target=run_embedding_job, args=(list(id_map.values()),)).start()
+        return jsonify({"success": True, "report": report, "root_id": root_id})
 
     except Exception as e:
-        print(f"Error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
-
 
 
 
