@@ -69,7 +69,7 @@ def run_embedding_job(node_ids):
 
 # --- CONSTANTS ---
 SIMILARITY_THRESHOLD_DUPLICATE = 0.85  # It's the same thing
-SIMILARITY_THRESHOLD_MERGE = 0.9      # It's related, check for new details
+SIMILARITY_THRESHOLD_MERGE = 0.75      # It's related, check for new details
 
 def smart_merge_or_create(cur, parent_id, node_data, user_email):
     """
