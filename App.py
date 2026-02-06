@@ -367,7 +367,7 @@ def upload_bytes_to_github(file_content_bytes, filename, folder_path="uploads"):
     try:
         # 1. Config
         token = os.getenv("GITHUB_TOKEN")
-        repo_full_name = "STS-Engineer/Knowledge_Group" # Hardcoded based on your prompt
+        repo_full_name = "STS-Engineer/AVOchatbot-backend" # Hardcoded based on your prompt
         branch = "main"
         
         if not token:
