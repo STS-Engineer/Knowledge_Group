@@ -140,17 +140,16 @@ def smart_merge_or_create(cur, parent_id, node_data, user_email):
                 return str(existing_id), f"skipped_no_new_info_vs_{existing_title}"
 
     # SCENARIO C: NEW CONTENT (Insert)
-    # [INSERT] Add created_by and updated_by
+    # [INSERT] Only set created_by
     cur.execute("""
-        INSERT INTO knowledge_node (parent_id, title, node_type, slug, structured_data, embedding, created_by, updated_by)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO knowledge_node (parent_id, title, node_type, slug, structured_data, embedding, created_by)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
         RETURNING id
     """, (
         parent_id, title, node_type, slug, 
         json.dumps({**new_struct, "explanation": narrative}),
         vector,
-        user_email, # created_by
-        user_email  # updated_by
+        user_email # created_by only
     ))
     
     return str(cur.fetchone()[0]), "created_new"
@@ -162,12 +161,12 @@ def resolve_parent_sync(cur, data, email):
     existing = cur.fetchone()
     if existing: return str(existing[0])
 
-    # Create New Domain Node (Sync Embedding)
+    # Create New Domain Node
     vec = generate_embedding(f"{data['title']}: {data.get('narrative', '')}")
     cur.execute("""
-        INSERT INTO knowledge_node (title, node_type, slug, structured_data, embedding, created_by, updated_by)
-        VALUES (%s, 'domain', %s, %s, %s, %s, %s) RETURNING id
-    """, (data['title'], data.get('slug'), json.dumps({"explanation": data.get('narrative')}), vec, email, email))
+        INSERT INTO knowledge_node (title, node_type, slug, structured_data, embedding, created_by)
+        VALUES (%s, 'domain', %s, %s, %s, %s) RETURNING id
+    """, (data['title'], data.get('slug'), json.dumps({"explanation": data.get('narrative')}), vec, email))
     return str(cur.fetchone()[0])
 
 # --- Recursive Path Finder ---
