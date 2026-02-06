@@ -293,7 +293,54 @@ def store_structure():
                     report.append({"title": node['title'], "status": status, "id": real_id})
 
                 # Process Keywords & Relationships...
-                # (Keep your existing keyword/relationship logic here)
+                # --- Step 3: Keywords ---
+                keywords = data.get('keywords', [])
+                for kw in keywords:
+                    # Insert keyword and sync synonyms
+                    cur.execute("""
+                        INSERT INTO keyword (label, synonyms) 
+                        VALUES (%s, %s)
+                        ON CONFLICT (label) DO UPDATE SET synonyms = EXCLUDED.synonyms
+                        RETURNING id
+                    """, (kw['label'], json.dumps(kw.get('synonyms', []))))
+                    keyword_id = cur.fetchone()[0]
+
+                    # Link keyword to nodes via id_map
+                    for temp_id in kw.get('node_temp_ids', []):
+                        real_node_id = id_map.get(temp_id)
+                        if real_node_id:
+                            cur.execute("""
+                                INSERT INTO node_keyword (node_id, keyword_id, weight)
+                                VALUES (%s, %s, %s)
+                                ON CONFLICT (node_id, keyword_id) 
+                                DO UPDATE SET weight = EXCLUDED.weight
+                            """, (real_node_id, keyword_id, kw.get('weight', 1.0)))
+
+                # --- Step 4: Relationships (Knowledge Edges) ---
+                relationships = data.get('relationships', [])
+                for rel in relationships:
+                    source_id = id_map.get(rel['source_temp_id'])
+                    target_id = id_map.get(rel['target_temp_id'])
+                    
+                    if source_id and target_id:
+                        # Check for existing edge to prevent duplicates
+                        cur.execute("""
+                            SELECT id FROM knowledge_edge 
+                            WHERE source_node_id = %s AND target_node_id = %s AND relation_type = %s
+                        """, (source_id, target_id, rel['relation_type']))
+                        
+                        if not cur.fetchone():
+                            cur.execute("""
+                                INSERT INTO knowledge_edge 
+                                (source_node_id, target_node_id, relation_type, description, created_by)
+                                VALUES (%s, %s, %s, %s, %s)
+                            """, (
+                                source_id, 
+                                target_id, 
+                                rel['relation_type'], 
+                                rel.get('description'), 
+                                user_email # Audit tracking
+                            ))
 
             conn.commit()
 
