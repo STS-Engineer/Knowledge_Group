@@ -26,7 +26,8 @@ def generate_embedding(text):
     try:
         response = client.embeddings.create(
             input=text,
-            model="text-embedding-3-small"
+            model="text-embedding-3-large",
+            dimensions=1536
         )
         return response.data[0].embedding
     except Exception as e:
